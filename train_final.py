@@ -3,12 +3,12 @@
 import os
 import json
 import numpy as np
-import shutil
+
 from pathlib import Path
 
 # reset outputs như cũ
 # chỉ dọn folder của final, KHÔNG đụng baseline
-import shutil, os
+
 
 os.makedirs("outputs/final", exist_ok=True)
 # tuyệt đối không xóa outputs/baseline

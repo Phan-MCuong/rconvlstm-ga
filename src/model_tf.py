@@ -62,13 +62,15 @@ def compile_model(model, lr=1e-3, loss="mse"):
     """
     opt = tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0)
     model.compile(
-        optimizer=opt,
-        loss=loss,
-        metrics=[
-            tf.keras.metrics.MAE(name="mae"),
-            tf.keras.metrics.MSE(name="mse"),
-            tf.keras.metrics.RootMeanSquaredError(name="rmse"),
-            r2_metric
-        ],
-    )
+    optimizer=opt,
+    loss=loss,
+    metrics=[
+        tf.keras.metrics.MeanAbsoluteError(),
+        tf.keras.metrics.MeanSquaredError(),
+        tf.keras.metrics.RootMeanSquaredError(),
+        r2_metric
+    ],
+)
+
+
     return model
