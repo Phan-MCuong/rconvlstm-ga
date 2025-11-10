@@ -19,7 +19,7 @@ def main():
     print(f"Percentiles p2,p98 = {rng}")
 
     # chọn T_in trong 4..7
-    T_in, T_out = 5, 1
+    T_in, T_out = 64, 1
     X, Y = make_windows(normed, T_in=T_in, T_out=T_out)
     print(f"X shape: {X.shape}, Y shape: {Y.shape}, dtype: {X.dtype}")
 
