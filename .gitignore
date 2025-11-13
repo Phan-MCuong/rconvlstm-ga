@@ -1,5 +1,23 @@
+# virtual environment
 .venv/
-outputs/
-checkpoints/
+venv/
+ENV/
+
+# python cache
 __pycache__/
-*.zip
+*.pyc
+*.pyo
+*.pyd
+
+# checkpoints
+checkpoints/
+runs/
+outputs/
+outputs_convrnn/
+
+# system garbage
+*.DS_Store
+Thumbs.db
+
+# temporary numpy or data
+data_npy/
