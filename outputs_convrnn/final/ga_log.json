@@ -1,0 +1,23 @@
+{
+  "gen": 2,
+  "best_fit": 0.10887732688732146,
+  "best_genome": {
+    "f1": 32,
+    "f2": 16,
+    "ks": 3,
+    "use_bn": 1,
+    "dropout": 0.0,
+    "lr": 0.001,
+    "batch": 1
+  },
+  "best_overall": {
+    "f1": 32,
+    "f2": 16,
+    "ks": 3,
+    "use_bn": 1,
+    "dropout": 0.0,
+    "lr": 0.001,
+    "batch": 1
+  },
+  "best_fit_overall": 0.10868025157995223
+}

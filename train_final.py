@@ -1,177 +1,214 @@
-# train_final.py — bản đã sửa để xuất MSE/MAE/RMSE/R2 + lưu JSON/CSV/history
-
-import os
-import json
-import numpy as np
-
+# -*- coding: utf-8 -*-
+import os, json
 from pathlib import Path
-
-# reset outputs như cũ
-# chỉ dọn folder của final, KHÔNG đụng baseline
-
-
-os.makedirs("outputs/final", exist_ok=True)
-# tuyệt đối không xóa outputs/baseline
-
-
+import numpy as np
 from PIL import Image
 import tensorflow as tf
+from tensorflow.keras import layers, models, regularizers
 
-from src.data import load_zip_gray, robust_minmax_global, make_windows
-from src.model_tf import build_convlstm_relu, compile_model
-from src.metrics import composite_fitness
-from src.data import T_IN, load_dataset   # hoặc load_data/make_windows tùy file bạn
-print(f"[INFO] T_IN={T_IN}")
+# =========================
+# CẤU HÌNH
+# =========================
+DATA_DIR = "./data/phadin"
+RESIZE  = (128, 128)
+T_IN    = 32
+T_OUT   = 1
+SEED    = 42
 
+# =========================
+# TIỆN ÍCH
+# =========================
+def _read_folder_gray(folder, resize=(128,128)):
+    files = sorted([f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
+    if not files:
+        raise RuntimeError(f"Folder rỗng: {folder}")
+    frames = []
+    for fn in files:
+        p = os.path.join(folder, fn)
+        im = Image.open(p).convert("L").resize(resize, Image.BICUBIC)
+        arr = np.array(im, dtype=np.float32) / 255.0
+        frames.append(arr[..., None])
+    return np.stack(frames, axis=0)  # (T,H,W,1)
 
-# === THÊM: bộ metrics numpy để tính và lưu chỉ số ===
-from utils.metrics_np import mse, mae, rmse, r2, save_metrics
+def _robust_minmax_global(seq, lo_pct=2, hi_pct=98):
+    flat = seq.reshape(-1)
+    p2  = float(np.percentile(flat, lo_pct))
+    p98 = float(np.percentile(flat, hi_pct))
+    if p98 <= p2:
+        p2, p98 = 0.0, 1.0
+    x = np.clip(seq, p2, p98)
+    x = (x - p2) / (p98 - p2)
+    x = np.clip(x, 0.0, 1.0).astype(np.float32)
+    return x, (p2, p98)
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # bớt ồn
-# os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # nếu muốn tắt oneDNN để số đỡ lắc
+def _make_windows_from_seq(seq, T_in=32, T_out=1):
+    T = seq.shape[0]
+    N = T - T_in - T_out + 1
+    if N <= 0:
+        raise RuntimeError(f"Không đủ khung để cắt cửa sổ T_in={T_in}, T_out={T_out}. Có {T} khung.")
+    X, Y = [], []
+    for i in range(N):
+        X.append(seq[i:i+T_in])
+        Y.append(seq[i+T_in:i+T_in+T_out])
+    return np.stack(X), np.stack(Y)
 
+def _split_train_val_test(N, ratio=(0.7, 0.15, 0.15)):
+    n_tr = int(N * ratio[0])
+    n_va = int(N * ratio[1])
+    n_te = N - n_tr - n_va
+    if n_tr == 0 and N >= 1: n_tr = 1
+    if n_va == 0 and N - n_tr >= 2: n_va = 1
+    n_te = N - n_tr - n_va
+    return n_tr, n_va, n_te
 
-def save01(a, path):
-    arr = np.clip(a.squeeze(), 0, 1) * 255.0
+def _save_img01(arr, path):
+    arr = np.clip(arr.squeeze(), 0, 1) * 255.0
     Image.fromarray(arr.astype(np.uint8)).save(path)
 
+# numpy metrics
+def _mse(y, yhat): return float(np.mean((y - yhat) ** 2))
+def _mae(y, yhat): return float(np.mean(np.abs(y - yhat)))
+def _rmse(y, yhat): return float(np.sqrt(np.mean((y - yhat) ** 2)))
+def _r2(y, yhat):
+    y_true = y.reshape(-1)
+    y_pred = yhat.reshape(-1)
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2)) + 1e-12
+    return 1.0 - ss_res / ss_tot
 
-def time_split_windows(normed_seq_list, T_in=4, T_out=1, gap=2):
-    if len(normed_seq_list) == 1:
-        seq = normed_seq_list[0]
-        T_total = seq.shape[0]
-        split_t = int(0.8 * T_total)
-        start_val = max(0, split_t - (T_in + gap))
-        Xtr, Ytr = make_windows([seq[:split_t]], T_in=T_in, T_out=T_out)
-        Xva, Yva = make_windows([seq[start_val:]], T_in=T_in, T_out=T_out)
-        return Xtr, Ytr, Xva, Yva
-    # nhiều sequence thì nối như cũ
-    Xtr_list, Ytr_list, Xva_list, Yva_list = [], [], [], []
-    for seq in normed_seq_list:
-        T_total = seq.shape[0]
-        split_t = int(0.8 * T_total)
-        start_val = max(0, split_t - (T_in + gap))
-        Xtr_s, Ytr_s = make_windows([seq[:split_t]], T_in=T_in, T_out=T_out)
-        Xva_s, Yva_s = make_windows([seq[start_val:]], T_in=T_in, T_out=T_out)
-        Xtr_list.append(Xtr_s); Ytr_list.append(Ytr_s)
-        Xva_list.append(Xva_s); Yva_list.append(Yva_s)
-    return (np.concatenate(Xtr_list), np.concatenate(Ytr_list),
-            np.concatenate(Xva_list), np.concatenate(Yva_list))
+# =========================
+# MÔ HÌNH
+# =========================
+def build_convlstm_relu(input_shape, out_frames=1, filters=(16, 32),
+                        kernels=(3, 3), use_bn=False, dropout=0.1, relu_cap=1.0):
+    x_in = layers.Input(shape=input_shape)
+    x = x_in
+    for i, f in enumerate(filters):
+        x = layers.ConvLSTM2D(
+            filters=f,
+            kernel_size=(kernels[i], kernels[i]),
+            padding="same",
+            return_sequences=(i < len(filters)-1),
+            activation="tanh",
+            kernel_regularizer=regularizers.l2(1e-6)
+        )(x)
+        if use_bn:
+            x = layers.BatchNormalization()(x)
+        if dropout and dropout > 0:
+            x = layers.Dropout(dropout)(x)
 
+    x = layers.Conv2D(out_frames, 3, padding="same")(x)
+    x = layers.ReLU(max_value=relu_cap)(x)
+    x = layers.Reshape((1, input_shape[1], input_shape[2], 1))(x)
+    return models.Model(x_in, x)
 
+def compile_model(model, lr=4.192837222944945e-4, loss="mse"):
+    opt = tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0)
+    metrics = [
+        tf.keras.metrics.MeanAbsoluteError(name="mae"),
+        tf.keras.metrics.MeanSquaredError(name="mse"),
+        tf.keras.metrics.RootMeanSquaredError(name="rmse"),
+    ]
+    model.compile(optimizer=opt, loss=loss, metrics=metrics)
+    return model
+
+# =========================
+# MAIN
+# =========================
 def main():
-    # 1) genome tốt nhất từ GA (giữ nguyên)
-    genome = {
-        "T_in": 4,
-        "filters": (16, 32),
-        "kernels": (5, 5),
-        "dropout": 0.059,
-        "use_bn": False,
-        "relu_cap": 1.0,
-        "lr": 4.1928371317716517e-04,
-        "batch": 4
-    }
+    tf.random.set_seed(SEED)
+    np.random.seed(SEED)
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-    zip_path = os.environ.get("DATA_ZIP", "./data/Phadin.zip")
     out_dir = Path("outputs/final")
     out_dir.mkdir(parents=True, exist_ok=True)
     Path("checkpoints").mkdir(parents=True, exist_ok=True)
 
-    # 2) dữ liệu
-    from src.data import load_folder_gray
-    seqs = load_folder_gray("./data/phadin", resize=(128, 128))
+    # 1) Load & normalize
+    seq = _read_folder_gray(DATA_DIR, RESIZE)
+    seq, (p2, p98) = _robust_minmax_global(seq, 2, 98)
+    print(f"[INFO] p2,p98 = ({p2}, {p98})")
 
-    normed, rng = robust_minmax_global(seqs, 2, 98)
-    print(f"[INFO] p2,p98 = {rng}")
+    # 2) Windows & split
+    X, Y = _make_windows_from_seq(seq, T_in=T_IN, T_out=T_OUT)
+    N = X.shape[0]
+    print(f"[INFO] Tổng số cửa sổ: {N}")
+    n_tr, n_va, n_te = _split_train_val_test(N, (0.7, 0.15, 0.15))
+    if n_tr + n_va + n_te != N:
+        n_te = N - n_tr - n_va
 
-    T_in, T_out = genome["T_in"], 1
-    Xtr, Ytr, Xva, Yva = time_split_windows(normed, T_in=T_in, T_out=T_out, gap=2)
-    print(f"[INFO] Xtr:{Xtr.shape}  Xva:{Xva.shape}")
+    Xtr, Ytr = X[:n_tr], Y[:n_tr]
+    Xva, Yva = X[n_tr:n_tr+n_va], Y[n_tr:n_tr+n_va]
+    Xte, Yte = X[n_tr+n_va:], Y[n_tr+n_va:]
+    print(f"[SPLIT] train={len(Xtr)} val={len(Xva)} test={len(Xte)}")
 
-    # 3) model theo genome
+    # 3) Model (final do GA gợi ý: filters nhỏ, không BN, scheduler LR)
+    H, W = X.shape[2], X.shape[3]
     model = build_convlstm_relu(
-        input_shape=(T_in, Xtr.shape[2], Xtr.shape[3], 1),
-        out_frames=T_out,
-        filters=genome["filters"],
-        kernels=genome["kernels"],
-        use_bn=genome["use_bn"],
-        dropout=genome["dropout"],
-        relu_cap=genome["relu_cap"]
+        input_shape=(T_IN, H, W, 1),
+        out_frames=T_OUT,
+        filters=(16, 32),
+        kernels=(3, 3),
+        use_bn=False,
+        dropout=0.1,
+        relu_cap=1.0
     )
-    compile_model(model, lr=genome["lr"])  # vẫn dùng Huber/optimizer mặc định trong project
+    compile_model(model, lr=4.192837222944945e-4, loss="mse")
     model.summary()
 
-    # callbacks
-    cbs = [
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath="checkpoints/final_model.weights.h5",
-            monitor="val_loss", save_best_only=True, save_weights_only=True, verbose=1
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=1, min_lr=1e-5, verbose=1
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=3, restore_best_weights=True, verbose=1
-        )
+    # 4) Callback
+    ckpt_path = "checkpoints/final.keras"
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
+        tf.keras.callbacks.ModelCheckpoint(ckpt_path, save_best_only=True, monitor="val_loss", mode="min"),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, verbose=0, min_lr=1e-6),
     ]
 
-    # 4) train
-    print(f"[INFO] Training final...")
-    hist = model.fit(
-        Xtr, Ytr,
-        validation_data=(Xva, Yva),
-        epochs=20,
-        batch_size=genome["batch"],
-        verbose=1,
-        callbacks=cbs
-    )
-    best_val = float(np.min(hist.history["val_loss"]))
-    print("[INFO] Best val_loss:", best_val)
+    # 5) Train nếu có dữ liệu
+    history = {"loss":[], "val_loss":[]}
+    if len(Xtr) > 0 and len(Xva) > 0:
+        hist = model.fit(
+            Xtr, Ytr,
+            validation_data=(Xva, Yva),
+            epochs=20,
+            batch_size=1,
+            verbose=1,
+            callbacks=callbacks
+        )
+        history = {k: [float(vv) for vv in val] for k, val in hist.history.items()}
+    else:
+        print("[WARN] Không đủ dữ liệu cho train/val. Bỏ qua train, chỉ đánh giá test.")
 
-    # 5) Dự báo toàn bộ validation để tính MSE/MAE/RMSE/R2
-    print("\n[final] Đang dự báo trên tập validation để tính chỉ số...")
-    y_pred_all = model.predict(Xva, verbose=0)  # shape: (N, 1, H, W, 1)
+    with open(out_dir / "training_history_final.json", "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
 
+    # 6) Evaluate TEST
+    if len(Xte) == 0:
+        print("[WARN] Không có tập test để đánh giá.")
+        return
+
+    y_pred = model.predict(Xte, verbose=0)
     metrics = {
-        "MSE": float(mse(Yva, y_pred_all)),
-        "MAE": float(mae(Yva, y_pred_all)),
-        "RMSE": float(rmse(Yva, y_pred_all)),
-        "R2": float(r2(Yva, y_pred_all)),
-        "best_val_loss": best_val
+        "MSE":  _mse(Yte, y_pred),
+        "MAE":  _mae(Yte, y_pred),
+        "RMSE": _rmse(Yte, y_pred),
+        "R2":   _r2(Yte, y_pred),
+        "best_val_loss": float(min(history.get("val_loss", [np.inf])))
     }
+    with open(out_dir / "metrics_final.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    with open(out_dir / "metrics_final.csv", "w", encoding="utf-8") as f:
+        f.write("metric,value\n" + "\n".join([f"{k},{v}" for k,v in metrics.items()]))
 
-    print("[final] Kết quả đánh giá (validation):")
+    # 7) Ảnh minh họa test đầu
+    _save_img01(Xte[0, -1], out_dir / "final_input_last.png")
+    _save_img01(Yte[0, 0],  out_dir / "final_target.png")
+    _save_img01(y_pred[0, 0], out_dir / "final_pred.png")
+
+    print("[final][TEST] Metrics:")
     for k, v in metrics.items():
         print(f"  {k}: {v:.6f}")
-
-    # lưu metrics + history
-    save_metrics(metrics, out_dir / "metrics_final.json", out_dir / "metrics_final.csv")
-    with open(out_dir / "training_history_final.json", "w", encoding="utf-8") as f:
-        json.dump({k: [float(x) for x in v] for k, v in hist.history.items()},
-                  f, ensure_ascii=False, indent=2)
-    print(f"[final] Đã lưu metrics và history vào {out_dir}")
-
-    # 6) Composite fitness tham khảo trên k mẫu đầu (giữ nguyên logic báo cáo)
-    k = min(8, Xva.shape[0])
-    y_pred_k = y_pred_all[:k]
-    fits = []
-    for i in range(k):
-        fits.append(composite_fitness(y_pred_k[i, 0], Yva[i, 0], model.count_params()))
-    fit_mean = float(np.mean(fits))
-    print(f"[INFO] Mean composite fitness on first {k} val samples: {fit_mean:.6f}")
-
-    # 7) Lưu ảnh minh họa
-    save01(Xva[0, -1], out_dir / "final_input_last.png")
-    save01(Yva[0, 0],  out_dir / "final_target.png")
-    save01(y_pred_all[0, 0], out_dir / "final_pred.png")
-    print("[INFO] Saved images to outputs/final/")
-
-    # 8) Lưu model và genome
-    model.save("checkpoints/convlstm_relu_final.keras")
-    with open("checkpoints/final_genome.json", "w", encoding="utf-8") as f:
-        json.dump(genome, f, ensure_ascii=False, indent=2)
-    print("[INFO] Saved model and genome.")
-
+    print("[final] Done.")
 
 if __name__ == "__main__":
     main()
